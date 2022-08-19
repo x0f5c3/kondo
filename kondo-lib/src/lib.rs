@@ -1,3 +1,9 @@
+use jwalk::Parallelism;
+use rayon::prelude::*;
+use std::borrow::Borrow;
+use std::fmt::Error;
+use std::iter::FromIterator;
+use std::path::PathBuf;
 use std::{
     error::{self, Error},
     fs, path,
@@ -197,7 +203,7 @@ impl Project {
     }
 }
 
-fn is_hidden(entry: &walkdir::DirEntry) -> bool {
+fn is_hidden(entry: &jwalk::DirEntry<((), ())>) -> bool {
     entry
         .file_name()
         .to_str()
@@ -207,11 +213,12 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
 
 struct ProjectIter {
     it: walkdir::IntoIter,
+    it2: jwalk::DirEntryIter<((), ())>,
 }
 
 pub enum Red {
-    IOError(::std::io::Error),
-    WalkdirError(walkdir::Error),
+    IOError(std::io::Error),
+    WalkdirError(jwalk::Error),
 }
 
 impl Iterator for ProjectIter {
@@ -219,7 +226,7 @@ impl Iterator for ProjectIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let entry: walkdir::DirEntry = match self.it.next() {
+            let entry: jwalk::DirEntry<((), ())> = match self.it2.next() {
                 None => return None,
                 Some(Err(e)) => return Some(Err(Red::WalkdirError(e))),
                 Some(Ok(entry)) => entry,
@@ -235,57 +242,100 @@ impl Iterator for ProjectIter {
                 Err(e) => return Some(Err(Red::IOError(e))),
                 Ok(rd) => rd,
             };
+            return rd
+                .into_iter()
+                .par_bridge()
+                .filter_map(|rd| rd.ok())
+                .filter_map(|de| {
+                    if let Some(name) = de.file_name().to_str() {
+                        return Some((name.to_string(), de.path()));
+                    }
+                    None
+                })
+                .filter_map(|(filename, path)| {
+                    if let Some(ty) = get_project_type(&filename) {
+                        return Some(Ok(Project {
+                            project_type: ty,
+                            path,
+                        }));
+                    }
+                    None
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .next();
+
             // intentionally ignoring errors while iterating the ReadDir
             // can't return them because we'll lose the context of where we are
-            for dir_entry in rd.filter_map(|rd| rd.ok()).map(|de| de.file_name()) {
-                let file_name = match dir_entry.to_str() {
-                    None => continue,
-                    Some(file_name) => file_name,
-                };
-                let p_type = match file_name {
-                    FILE_CARGO_TOML => Some(ProjectType::Cargo),
-                    FILE_PACKAGE_JSON => Some(ProjectType::Node),
-                    FILE_ASSEMBLY_CSHARP => Some(ProjectType::Unity),
-                    FILE_STACK_HASKELL => Some(ProjectType::Stack),
-                    FILE_SBT_BUILD => Some(ProjectType::SBT),
-                    FILE_MVN_BUILD => Some(ProjectType::Maven),
-                    FILE_CMAKE_BUILD => Some(ProjectType::CMake),
-                    FILE_COMPOSER_JSON => Some(ProjectType::Composer),
-                    file_name if file_name.ends_with(FILE_UNREAL_SUFFIX) => {
-                        Some(ProjectType::Unreal)
-                    }
-                    file_name if file_name.ends_with(FILE_JUPYTER_SUFFIX) => {
-                        Some(ProjectType::Jupyter)
-                    }
-                    file_name if file_name.ends_with(FILE_PYTHON_SUFFIX) => {
-                        Some(ProjectType::Python)
-                    }
-                    _ => None,
-                };
-                if let Some(project_type) = p_type {
-                    self.it.skip_current_dir();
-                    return Some(Ok(Project {
-                        project_type,
-                        path: entry.path().to_path_buf(),
-                    }));
-                }
-            }
+            // for dir_entry in to_iter.into_par_iter() {
+            //     let file_name = match dir_entry.to_str() {
+            //         None => continue,
+            //         Some(file_name) => file_name,
+            //     };
+            //     if let Some(project_type) = get_project_type(file_name) {
+            //         self.it.skip_current_dir();
+            //         return Some(Ok(Project {
+            //             project_type,
+            //             path: entry.path(),
+            //         }));
+            //     }
+            // }
         }
     }
 }
 
+fn get_project_type(file_name: &str) -> Option<ProjectType> {
+    match file_name {
+        FILE_CARGO_TOML => Some(ProjectType::Cargo),
+        FILE_PACKAGE_JSON => Some(ProjectType::Node),
+        FILE_ASSEMBLY_CSHARP => Some(ProjectType::Unity),
+        FILE_STACK_HASKELL => Some(ProjectType::Stack),
+        FILE_SBT_BUILD => Some(ProjectType::SBT),
+        FILE_MVN_BUILD => Some(ProjectType::Maven),
+        FILE_CMAKE_BUILD => Some(ProjectType::CMake),
+        FILE_COMPOSER_JSON => Some(ProjectType::Composer),
+        file_name if file_name.ends_with(FILE_UNREAL_SUFFIX) => Some(ProjectType::Unreal),
+        file_name if file_name.ends_with(FILE_JUPYTER_SUFFIX) => Some(ProjectType::Jupyter),
+        file_name if file_name.ends_with(FILE_PYTHON_SUFFIX) => Some(ProjectType::Python),
+        _ => None,
+    }
+}
+
 pub fn scan<P: AsRef<path::Path>>(p: &P) -> impl Iterator<Item = Result<Project, Red>> {
+    let j = jwalk::WalkDir::new(p)
+        .follow_links(SYMLINK_FOLLOW)
+        .skip_hidden(true)
+        .process_read_dir(|_, _, _, v| {
+            v.par_iter_mut()
+                .filter_map(|x| x.as_mut().ok())
+                .for_each(|mut x| {
+                    if !x.file_type.is_dir() {
+                        x.read_children_path = None;
+                        return;
+                    }
+                    if let Some(filename) = x.file_name.to_str() {
+                        if get_project_type(filename).is_some() {
+                            x.read_children_path = None;
+                        }
+                    }
+                })
+        })
+        .parallelism(Parallelism::RayonDefaultPool)
+        .into_iter();
     ProjectIter {
         it: walkdir::WalkDir::new(p)
             .follow_links(SYMLINK_FOLLOW)
             .into_iter(),
+        it2: j,
     }
 }
 
 pub fn dir_size(path: &path::Path) -> u64 {
-    walkdir::WalkDir::new(path)
+    jwalk::WalkDir::new(path)
         .follow_links(SYMLINK_FOLLOW)
+        .parallelism(Parallelism::RayonDefaultPool)
         .into_iter()
+        .par_bridge()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter_map(|e| e.metadata().ok())
@@ -313,30 +363,75 @@ pub fn pretty_size(size: u64) -> String {
 
     format!("{:.1}{}", size, symbol)
 }
+#[derive(Debug, Clone)]
+pub struct MultiError<E: Error> {
+    errs: Vec<E>,
+    success: Vec<Project>,
+}
+
+impl<E: Error> Error for MultiError<E> {}
+
+impl<E: Error> MultiError<E> {
+    pub fn errs(&self) -> &Vec<E> {
+        &self.errs
+    }
+    pub fn success(&self) -> &Vec<Project> {
+        &self.success
+    }
+}
+
+impl<E: Error> FromIterator<Result<Project, E>> for MultiError<E> {
+    fn from_iter<T: IntoIterator<Item = Result<Project, E>>>(iter: T) -> Self {
+        let mut res = MultiError {
+            errs: Vec::new(),
+            success: Vec::new(),
+        };
+        iter.into_iter().for_each(|x: Result<Project, E>| match x {
+            Ok(p) => res.success.push(p),
+            Err(e) => res.errs.push(e),
+        });
+        res
+    }
+}
 
 pub fn clean(project_path: &str) -> Result<(), Box<dyn error::Error>> {
     let project = fs::read_dir(project_path)?
+        .par_bridge()
         .filter_map(|rd| rd.ok())
-        .find_map(|dir_entry| {
+        .find_map_any(|dir_entry| {
             let file_name = dir_entry.file_name().into_string().ok()?;
-            let p_type = match file_name.as_str() {
-                FILE_CARGO_TOML => Some(ProjectType::Cargo),
-                FILE_PACKAGE_JSON => Some(ProjectType::Node),
-                FILE_ASSEMBLY_CSHARP => Some(ProjectType::Unity),
-                FILE_STACK_HASKELL => Some(ProjectType::Stack),
-                FILE_SBT_BUILD => Some(ProjectType::SBT),
-                FILE_MVN_BUILD => Some(ProjectType::Maven),
-                FILE_CMAKE_BUILD => Some(ProjectType::CMake),
-                FILE_COMPOSER_JSON => Some(ProjectType::Composer),
-                _ => None,
-            };
-            if let Some(project_type) = p_type {
+            // let p_type = match file_name.as_str() {
+            //     FILE_CARGO_TOML => Some(ProjectType::Cargo),
+            //     FILE_PACKAGE_JSON => Some(ProjectType::Node),
+            //     FILE_ASSEMBLY_CSHARP => Some(ProjectType::Unity),
+            //     FILE_STACK_HASKELL => Some(ProjectType::Stack),
+            //     FILE_SBT_BUILD => Some(ProjectType::SBT),
+            //     FILE_MVN_BUILD => Some(ProjectType::Maven),
+            //     FILE_CMAKE_BUILD => Some(ProjectType::CMake),
+            //     FILE_COMPOSER_JSON => Some(ProjectType::Composer),
+            //     _ => None,
+            // };
+            if let Some(project_type) = get_project_type(&file_name) {
                 return Some(Project {
                     project_type,
                     path: project_path.into(),
                 });
             }
             None
+        })
+        .map(|x| {
+            x.artifact_dirs()
+                .into_par_iter()
+                .copied()
+                .map(|ad| path::PathBuf::from(project_path).join(ad))
+                .filter(|ad| ad.exists())
+                .try_for_each(|x| {
+                    if let Err(e) = fs::remove_dir_all(x) {
+                        eprintln!("error removing directory {:?}: {:?}", x, e);
+                        return Err(e);
+                    }
+                    Ok(())
+                })
         });
 
     if let Some(project) = project {

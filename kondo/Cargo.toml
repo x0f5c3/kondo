@@ -19,7 +19,18 @@ edition = "2018"
 
 
 [dependencies]
-structopt = "0.3"
+rayon = "1.5.3"
+anyhow = "1.0.62"
+
+[dependencies.clap]
+version = "3.2.17"
+features = [
+	"unicode",
+	"derive",
+	"wrap_help",
+	"cargo",
+	"regex",
+]
 
 [dependencies.kondo-lib]
 path = "../kondo-lib"

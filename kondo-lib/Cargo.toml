@@ -10,3 +10,5 @@ license = "MIT"
 
 [dependencies]
 walkdir = "2"
+jwalk = "0.6.0"
+rayon = "1.5.3"

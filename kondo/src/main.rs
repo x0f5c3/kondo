@@ -1,45 +1,47 @@
-use structopt::StructOpt;
+use clap::Parser;
+
+use anyhow::Error;
+use rayon::prelude::*;
 
 use std::{
     env::current_dir,
-    error::Error,
     io::{stdin, stdout, BufRead, Write},
     path::PathBuf,
 };
 
 use kondo_lib::{dir_size, path_canonicalise, pretty_size, scan};
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "kondo")]
+#[derive(Parser, Debug)]
+#[clap(name = "kondo")]
 /// Kondo recursively cleans project directories.
 ///
 /// Supported project types: Cargo, Node, Unity, SBT, Haskell Stack, Maven, Unreal Engine, Jupyter Notebook, and Python projects.
 struct Opt {
     /// The directories to examine. Current directory will be used if DIRS is omitted.
-    #[structopt(name = "DIRS", parse(from_os_str))]
+    #[clap(name = "DIRS", parse(from_os_str))]
     dirs: Vec<PathBuf>,
 
     /// Quiet mode. Won't output to the terminal. -qq prevents all output.
-    #[structopt(short, long, parse(from_occurrences))]
+    #[clap(short, long, parse(from_occurrences))]
     quiet: u8,
 
     /// Clean all found projects without confirmation.
-    #[structopt(short, long)]
+    #[clap(short, long)]
     all: bool,
 }
 
-fn prepare_directories(dirs: Vec<PathBuf>) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+fn prepare_directories(dirs: Vec<PathBuf>) -> Result<Vec<PathBuf>, Error> {
     let cd = current_dir()?;
     if dirs.is_empty() {
         return Ok(vec![cd]);
     }
 
-    dirs.into_iter()
+    dirs.into_par_iter()
         .map(|d| path_canonicalise(&cd, d))
         .collect()
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Error> {
     let opt = Opt::from_args();
 
     if opt.quiet > 0 && !opt.all {
@@ -65,7 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let project_artifact_bytes = project
             .artifact_dirs()
-            .iter()
+            .par_iter()
             .copied()
             .filter_map(|dir| match dir_size(&project.path.join(dir)) {
                 0 => None,
